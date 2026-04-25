@@ -12,9 +12,12 @@ import type { Config } from '../config/config.js';
 import { Storage } from '../config/storage.js';
 import {
   addMemory,
+  applyInboxMemoryDraft,
   dismissInboxSkill,
+  dismissInboxMemoryDraft,
   listInboxSkills,
   listInboxPatches,
+  listInboxMemoryDrafts,
   applyInboxPatch,
   dismissInboxPatch,
   listMemoryFiles,
@@ -31,6 +34,7 @@ vi.mock('../utils/memoryDiscovery.js', () => ({
 vi.mock('../config/storage.js', () => ({
   Storage: {
     getUserSkillsDir: vi.fn(),
+    getGlobalGeminiDir: vi.fn(),
   },
 }));
 
@@ -312,6 +316,142 @@ describe('memory commands', () => {
 
       const skills = await listInboxSkills(missingConfig);
       expect(skills).toEqual([]);
+    });
+  });
+
+  describe('memory draft inbox', () => {
+    let tmpDir: string;
+    let memoryTempDir: string;
+    let projectRoot: string;
+    let globalMemoryDir: string;
+    let draftConfig: Config;
+
+    beforeEach(async () => {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'memory-draft-test-'));
+      memoryTempDir = path.join(tmpDir, 'memory-temp');
+      projectRoot = path.join(tmpDir, 'project');
+      globalMemoryDir = path.join(tmpDir, 'global');
+      await fs.mkdir(memoryTempDir, { recursive: true });
+      await fs.mkdir(projectRoot, { recursive: true });
+      await fs.mkdir(globalMemoryDir, { recursive: true });
+
+      draftConfig = {
+        storage: {
+          getProjectMemoryTempDir: () => memoryTempDir,
+          getProjectMemoryDir: () => memoryTempDir,
+          getProjectRoot: () => projectRoot,
+        },
+        getProjectRoot: () => projectRoot,
+        isTrustedFolder: () => true,
+      } as unknown as Config;
+      vi.mocked(Storage.getGlobalGeminiDir).mockReturnValue(globalMemoryDir);
+    });
+
+    afterEach(async () => {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    });
+
+    it('lists reviewable memory drafts with their target diff', async () => {
+      await fs.writeFile(path.join(memoryTempDir, 'MEMORY.md'), '- old\n');
+      const draftDir = path.join(memoryTempDir, '.inbox', 'private');
+      await fs.mkdir(draftDir, { recursive: true });
+      await fs.writeFile(path.join(draftDir, 'MEMORY.md'), '- new\n');
+
+      const drafts = await listInboxMemoryDrafts(draftConfig);
+
+      expect(drafts).toHaveLength(1);
+      expect(drafts[0]).toMatchObject({
+        kind: 'private',
+        relativePath: 'MEMORY.md',
+        name: 'MEMORY.md',
+        targetPath: path.join(memoryTempDir, 'MEMORY.md'),
+        content: '- new\n',
+      });
+      expect(drafts[0].diffContent).toContain('-- old');
+      expect(drafts[0].diffContent).toContain('+- new');
+      expect(drafts[0].extractedAt).toBeDefined();
+    });
+
+    it('applies a private memory draft and removes it from the inbox', async () => {
+      const draftDir = path.join(memoryTempDir, '.inbox', 'private');
+      await fs.mkdir(draftDir, { recursive: true });
+      await fs.writeFile(path.join(draftDir, 'MEMORY.md'), '- accepted\n');
+
+      const result = await applyInboxMemoryDraft(
+        draftConfig,
+        'private',
+        'MEMORY.md',
+      );
+
+      expect(result.success).toBe(true);
+      await expect(
+        fs.readFile(path.join(memoryTempDir, 'MEMORY.md'), 'utf-8'),
+      ).resolves.toBe('- accepted\n');
+      await expect(
+        fs.access(path.join(draftDir, 'MEMORY.md')),
+      ).rejects.toThrow();
+    });
+
+    it('applies a project instruction draft only for trusted workspaces', async () => {
+      const draftDir = path.join(
+        memoryTempDir,
+        '.inbox',
+        'project-instructions',
+      );
+      await fs.mkdir(draftDir, { recursive: true });
+      await fs.writeFile(path.join(draftDir, 'GEMINI.md'), 'Use pnpm.\n');
+
+      const untrustedConfig = {
+        storage: draftConfig.storage,
+        getProjectRoot: draftConfig.getProjectRoot,
+        isTrustedFolder: () => false,
+      } as unknown as Config;
+
+      const blocked = await applyInboxMemoryDraft(
+        untrustedConfig,
+        'project-instructions',
+        'GEMINI.md',
+      );
+      expect(blocked.success).toBe(false);
+      expect(blocked.message).toContain('trusted');
+
+      const applied = await applyInboxMemoryDraft(
+        draftConfig,
+        'project-instructions',
+        'GEMINI.md',
+      );
+      expect(applied.success).toBe(true);
+      await expect(
+        fs.readFile(path.join(projectRoot, 'GEMINI.md'), 'utf-8'),
+      ).resolves.toBe('Use pnpm.\n');
+    });
+
+    it('dismisses a memory draft from the inbox', async () => {
+      const draftDir = path.join(memoryTempDir, '.inbox', 'global');
+      await fs.mkdir(draftDir, { recursive: true });
+      await fs.writeFile(path.join(draftDir, 'GEMINI.md'), 'Prefer concise.\n');
+
+      const result = await dismissInboxMemoryDraft(
+        draftConfig,
+        'global',
+        'GEMINI.md',
+      );
+
+      expect(result.success).toBe(true);
+      await expect(
+        fs.access(path.join(draftDir, 'GEMINI.md')),
+      ).rejects.toThrow();
+    });
+
+    it('rejects invalid memory draft paths', async () => {
+      const result = await applyInboxMemoryDraft(
+        draftConfig,
+        'private',
+        '../MEMORY.md',
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Invalid memory draft path.');
     });
   });
 

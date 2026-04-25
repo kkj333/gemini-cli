@@ -566,6 +566,76 @@ describe('memoryService', () => {
       );
     });
 
+    it('rolls back direct active memory writes in review mode', async () => {
+      const { startMemoryService, readExtractionState } = await import(
+        './memoryService.js'
+      );
+      const { LocalAgentExecutor } = await import(
+        '../agents/local-executor.js'
+      );
+
+      vi.mocked(coreEvents.emitFeedback).mockClear();
+      vi.mocked(LocalAgentExecutor.create).mockReset();
+
+      const memoryDir = path.join(tmpDir, 'memory-review-rollback');
+      const skillsDir = path.join(tmpDir, 'skills-review-rollback');
+      const projectTempDir = path.join(tmpDir, 'temp-review-rollback');
+      const chatsDir = path.join(projectTempDir, 'chats');
+      await fs.mkdir(memoryDir, { recursive: true });
+      await fs.mkdir(skillsDir, { recursive: true });
+      await fs.mkdir(chatsDir, { recursive: true });
+      await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '- original\n');
+
+      const conversation = createConversation({
+        sessionId: 'review-rollback-session',
+        messageCount: 20,
+      });
+      await fs.writeFile(
+        path.join(chatsDir, 'session-2025-01-01T00-00-review001.json'),
+        JSON.stringify(conversation),
+      );
+
+      vi.mocked(LocalAgentExecutor.create).mockResolvedValueOnce({
+        run: vi.fn().mockImplementation(async () => {
+          await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '- changed\n');
+          await fs.writeFile(path.join(memoryDir, 'topic.md'), 'new topic\n');
+          return undefined;
+        }),
+      } as never);
+
+      const mockConfig = {
+        storage: {
+          getProjectMemoryDir: vi.fn().mockReturnValue(memoryDir),
+          getProjectMemoryTempDir: vi.fn().mockReturnValue(memoryDir),
+          getProjectSkillsMemoryDir: vi.fn().mockReturnValue(skillsDir),
+          getProjectTempDir: vi.fn().mockReturnValue(projectTempDir),
+        },
+        getToolRegistry: vi.fn(),
+        getMessageBus: vi.fn(),
+        getGeminiClient: vi.fn(),
+        getSkillManager: vi.fn().mockReturnValue({ getSkills: () => [] }),
+        getAutoMemoryMode: vi.fn().mockReturnValue('review'),
+        modelConfigService: {
+          registerRuntimeModelConfig: vi.fn(),
+        },
+        sandboxManager: undefined,
+      } as unknown as Parameters<typeof startMemoryService>[0];
+
+      await startMemoryService(mockConfig);
+
+      await expect(
+        fs.readFile(path.join(memoryDir, 'MEMORY.md'), 'utf-8'),
+      ).resolves.toBe('- original\n');
+      await expect(
+        fs.access(path.join(memoryDir, 'topic.md')),
+      ).rejects.toThrow();
+
+      const state = await readExtractionState(
+        path.join(memoryDir, '.extraction-state.json'),
+      );
+      expect(state.runs.at(-1)?.memoryFilesUpdated).toEqual([]);
+    });
+
     it('records only sessions whose read_file completed successfully as processed', async () => {
       const { startMemoryService, readExtractionState } = await import(
         './memoryService.js'

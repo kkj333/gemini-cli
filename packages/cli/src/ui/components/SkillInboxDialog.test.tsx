@@ -6,14 +6,22 @@
 
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Config, InboxSkill, InboxPatch } from '@google/gemini-cli-core';
+import type {
+  Config,
+  InboxSkill,
+  InboxPatch,
+  InboxMemoryDraft,
+} from '@google/gemini-cli-core';
 import {
   dismissInboxSkill,
+  dismissInboxMemoryDraft,
   listInboxSkills,
   listInboxPatches,
+  listInboxMemoryDrafts,
   moveInboxSkill,
   applyInboxPatch,
   dismissInboxPatch,
+  applyInboxMemoryDraft,
   isProjectSkillPatchTarget,
 } from '@google/gemini-cli-core';
 import { waitFor } from '../../test-utils/async.js';
@@ -27,11 +35,14 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
   return {
     ...original,
     dismissInboxSkill: vi.fn(),
+    dismissInboxMemoryDraft: vi.fn(),
     listInboxSkills: vi.fn(),
     listInboxPatches: vi.fn(),
+    listInboxMemoryDrafts: vi.fn(),
     moveInboxSkill: vi.fn(),
     applyInboxPatch: vi.fn(),
     dismissInboxPatch: vi.fn(),
+    applyInboxMemoryDraft: vi.fn(),
     isProjectSkillPatchTarget: vi.fn(),
     getErrorMessage: vi.fn((error: unknown) =>
       error instanceof Error ? error.message : String(error),
@@ -41,10 +52,13 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
 
 const mockListInboxSkills = vi.mocked(listInboxSkills);
 const mockListInboxPatches = vi.mocked(listInboxPatches);
+const mockListInboxMemoryDrafts = vi.mocked(listInboxMemoryDrafts);
 const mockMoveInboxSkill = vi.mocked(moveInboxSkill);
 const mockDismissInboxSkill = vi.mocked(dismissInboxSkill);
 const mockApplyInboxPatch = vi.mocked(applyInboxPatch);
 const mockDismissInboxPatch = vi.mocked(dismissInboxPatch);
+const mockApplyInboxMemoryDraft = vi.mocked(applyInboxMemoryDraft);
+const mockDismissInboxMemoryDraft = vi.mocked(dismissInboxMemoryDraft);
 const mockIsProjectSkillPatchTarget = vi.mocked(isProjectSkillPatchTarget);
 
 const inboxSkill: InboxSkill = {
@@ -74,6 +88,22 @@ const inboxPatch: InboxPatch = {
     },
   ],
   extractedAt: '2025-01-20T14:00:00Z',
+};
+
+const inboxMemoryDraft: InboxMemoryDraft = {
+  kind: 'private',
+  relativePath: 'MEMORY.md',
+  name: 'MEMORY.md',
+  targetPath: '/home/user/.gemini/tmp/project/memory/MEMORY.md',
+  content: '- use focused tests\n',
+  diffContent: [
+    '--- /home/user/.gemini/tmp/project/memory/MEMORY.md',
+    '+++ /home/user/.gemini/tmp/project/memory/MEMORY.md',
+    '@@ -1,1 +1,1 @@',
+    '-old',
+    '+use focused tests',
+  ].join('\n'),
+  extractedAt: '2025-01-21T10:00:00Z',
 };
 
 const workspacePatch: InboxPatch = {
@@ -142,6 +172,7 @@ describe('SkillInboxDialog', () => {
     vi.clearAllMocks();
     mockListInboxSkills.mockResolvedValue([inboxSkill]);
     mockListInboxPatches.mockResolvedValue([]);
+    mockListInboxMemoryDrafts.mockResolvedValue([]);
     mockMoveInboxSkill.mockResolvedValue({
       success: true,
       message: 'Moved "inbox-skill" to ~/.gemini/skills.',
@@ -157,6 +188,14 @@ describe('SkillInboxDialog', () => {
     mockDismissInboxPatch.mockResolvedValue({
       success: true,
       message: 'Dismissed "update-docs.patch" from inbox.',
+    });
+    mockApplyInboxMemoryDraft.mockResolvedValue({
+      success: true,
+      message: 'Applied memory draft "MEMORY.md".',
+    });
+    mockDismissInboxMemoryDraft.mockResolvedValue({
+      success: true,
+      message: 'Dismissed "MEMORY.md" from inbox.',
     });
     mockIsProjectSkillPatchTarget.mockImplementation(
       async (targetPath: string, config: Config) => {
@@ -174,6 +213,54 @@ describe('SkillInboxDialog', () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it('reviews and applies memory drafts', async () => {
+    mockListInboxSkills.mockResolvedValue([]);
+    mockListInboxMemoryDrafts.mockResolvedValue([inboxMemoryDraft]);
+    const config = {
+      isTrustedFolder: vi.fn().mockReturnValue(true),
+    } as unknown as Config;
+    const onReloadMemory = vi.fn().mockResolvedValue(undefined);
+    const { lastFrame, stdin, unmount, waitUntilReady } = await act(async () =>
+      renderWithProviders(
+        <SkillInboxDialog
+          config={config}
+          onClose={vi.fn()}
+          onReloadSkills={vi.fn()}
+          onReloadMemory={onReloadMemory}
+        />,
+      ),
+    );
+
+    await waitFor(() => {
+      expect(lastFrame()).toContain('MEMORY.md');
+    });
+
+    await act(async () => {
+      stdin.write('\r');
+      await waitUntilReady();
+    });
+
+    await waitFor(() => {
+      expect(lastFrame()).toContain('Review memory draft');
+    });
+
+    await act(async () => {
+      stdin.write('\r');
+      await waitUntilReady();
+    });
+
+    await waitFor(() => {
+      expect(mockApplyInboxMemoryDraft).toHaveBeenCalledWith(
+        config,
+        'private',
+        'MEMORY.md',
+      );
+      expect(onReloadMemory).toHaveBeenCalled();
+    });
+
+    unmount();
   });
 
   it('disables the project destination when the workspace is untrusted', async () => {

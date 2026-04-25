@@ -95,7 +95,7 @@ describe('SkillExtractionAgent', () => {
       'Skills: write SKILL.md candidates under /tmp/skills for /memory inbox review.',
     );
     expect(autoApplyPrompt).toContain(
-      'Project/shared instructions: write patch candidates under /tmp/memory/.inbox/project-instructions/ only.',
+      'Project/shared instructions: write complete markdown drafts under /tmp/memory/.inbox/project-instructions/',
     );
   });
 

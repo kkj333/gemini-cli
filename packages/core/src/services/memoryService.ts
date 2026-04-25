@@ -1002,14 +1002,71 @@ async function snapshotActiveProjectMemory(
   );
 }
 
-function diffSnapshots(before: FileSnapshot, after: FileSnapshot): string[] {
-  const changed: string[] = [];
+interface FileSnapshotDiff {
+  added: string[];
+  updated: string[];
+  deleted: string[];
+}
+
+function diffFileSnapshots(
+  before: FileSnapshot,
+  after: FileSnapshot,
+): FileSnapshotDiff {
+  const added: string[] = [];
+  const updated: string[] = [];
+  const deleted: string[] = [];
+
   for (const [relativePath, content] of after) {
-    if (before.get(relativePath) !== content) {
-      changed.push(relativePath);
+    if (!before.has(relativePath)) {
+      added.push(relativePath);
+    } else if (before.get(relativePath) !== content) {
+      updated.push(relativePath);
     }
   }
-  return changed.sort();
+
+  for (const relativePath of before.keys()) {
+    if (!after.has(relativePath)) {
+      deleted.push(relativePath);
+    }
+  }
+
+  return {
+    added: added.sort(),
+    updated: updated.sort(),
+    deleted: deleted.sort(),
+  };
+}
+
+function getChangedSnapshotPaths(diff: FileSnapshotDiff): string[] {
+  return [...diff.added, ...diff.updated].sort();
+}
+
+function getAllSnapshotDiffPaths(diff: FileSnapshotDiff): string[] {
+  return [...diff.added, ...diff.updated, ...diff.deleted].sort();
+}
+
+async function restoreFileSnapshot(
+  rootDir: string,
+  before: FileSnapshot,
+  after: FileSnapshot,
+  diff: FileSnapshotDiff,
+): Promise<void> {
+  for (const relativePath of diff.added) {
+    if (!after.has(relativePath)) {
+      continue;
+    }
+    await fs.rm(path.join(rootDir, relativePath), { force: true });
+  }
+
+  for (const relativePath of [...diff.updated, ...diff.deleted]) {
+    const content = before.get(relativePath);
+    if (content === undefined) {
+      continue;
+    }
+    const filePath = path.join(rootDir, relativePath);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, content, 'utf-8');
+  }
 }
 
 function prefixRelativePaths(
@@ -1110,6 +1167,7 @@ export async function startMemoryService(config: Config): Promise<void> {
       `[MemoryService] ${skillsBefore.size} existing skill(s) in memory`,
     );
 
+    const autoMemoryMode = getAutoMemoryMode(config);
     const inboxCandidatesBefore = await snapshotInboxCandidates(memoryDir);
     const activeMemoryBefore = await snapshotActiveProjectMemory(memoryDir);
 
@@ -1130,7 +1188,7 @@ export async function startMemoryService(config: Config): Promise<void> {
       sessionIndex,
       existingSkillsSummary,
       memoryDir,
-      getAutoMemoryMode(config),
+      autoMemoryMode,
     );
 
     const context = buildAgentLoopContext(config);
@@ -1238,15 +1296,38 @@ export async function startMemoryService(config: Config): Promise<void> {
 
     const memoryCandidatesCreated = prefixRelativePaths(
       '.inbox',
-      diffSnapshots(
-        inboxCandidatesBefore,
-        await snapshotInboxCandidates(memoryDir),
+      getChangedSnapshotPaths(
+        diffFileSnapshots(
+          inboxCandidatesBefore,
+          await snapshotInboxCandidates(memoryDir),
+        ),
       ),
     );
-    const memoryFilesUpdated = diffSnapshots(
+    const activeMemoryAfter = await snapshotActiveProjectMemory(memoryDir);
+    const activeMemoryDiff = diffFileSnapshots(
       activeMemoryBefore,
-      await snapshotActiveProjectMemory(memoryDir),
+      activeMemoryAfter,
     );
+    let memoryFilesUpdated =
+      autoMemoryMode === 'autoApply'
+        ? getChangedSnapshotPaths(activeMemoryDiff)
+        : [];
+
+    if (autoMemoryMode !== 'autoApply') {
+      const rejectedMemoryWrites = getAllSnapshotDiffPaths(activeMemoryDiff);
+      if (rejectedMemoryWrites.length > 0) {
+        await restoreFileSnapshot(
+          memoryDir,
+          activeMemoryBefore,
+          activeMemoryAfter,
+          activeMemoryDiff,
+        );
+        debugLogger.log(
+          `[MemoryService] Rejected ${rejectedMemoryWrites.length} active memory write(s) in review mode: ${rejectedMemoryWrites.join(', ')}`,
+        );
+        memoryFilesUpdated = [];
+      }
+    }
 
     const processedSessions = candidateSessions
       .filter((session) =>

@@ -13,6 +13,7 @@ import type { Config } from '../config/config.js';
 import { Storage } from '../config/storage.js';
 import { flattenMemory } from '../config/memory.js';
 import { loadSkillFromFile, loadSkillsFromDir } from '../skills/skillLoader.js';
+import { getGlobalMemoryFilePath } from '../tools/memoryTool.js';
 import {
   type AppliedSkillPatchTarget,
   applyParsedSkillPatches,
@@ -338,6 +339,31 @@ export interface InboxPatch {
   extractedAt?: string;
 }
 
+export type InboxMemoryDraftKind =
+  | 'private'
+  | 'global'
+  | 'project-instructions';
+
+/**
+ * Represents a markdown memory draft found in the extraction inbox.
+ */
+export interface InboxMemoryDraft {
+  /** Draft category under `.inbox`. */
+  kind: InboxMemoryDraftKind;
+  /** Path relative to the draft category directory. */
+  relativePath: string;
+  /** Display name. */
+  name: string;
+  /** Absolute path that will be updated when the draft is applied. */
+  targetPath: string;
+  /** Raw draft content for preview. */
+  content: string;
+  /** Unified diff from the current target content to the draft. */
+  diffContent: string;
+  /** When the draft was extracted (ISO string), if known. */
+  extractedAt?: string;
+}
+
 interface StagedInboxPatchTarget {
   targetPath: string;
   tempPath: string;
@@ -372,6 +398,133 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function getMemoryDraftRoot(
+  memoryDir: string,
+  kind: InboxMemoryDraftKind,
+): string {
+  return path.join(memoryDir, '.inbox', kind);
+}
+
+function isSubpathOrSame(childPath: string, parentPath: string): boolean {
+  const relativePath = path.relative(parentPath, childPath);
+  return (
+    relativePath === '' ||
+    (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))
+  );
+}
+
+function normalizeInboxMemoryDraftPath(
+  relativePath: string,
+): string | undefined {
+  if (
+    relativePath.length === 0 ||
+    path.isAbsolute(relativePath) ||
+    relativePath.includes('\\')
+  ) {
+    return undefined;
+  }
+
+  const normalizedPath = path.posix.normalize(relativePath);
+  if (
+    normalizedPath === '.' ||
+    normalizedPath.startsWith('../') ||
+    normalizedPath === '..' ||
+    !normalizedPath.endsWith('.md')
+  ) {
+    return undefined;
+  }
+  return normalizedPath;
+}
+
+function resolveProjectRoot(config: Config): string {
+  if (typeof config.getProjectRoot === 'function') {
+    return config.getProjectRoot();
+  }
+  return config.storage.getProjectRoot();
+}
+
+function resolveMemoryDraftTargetPath(
+  config: Config,
+  kind: InboxMemoryDraftKind,
+  relativePath: string,
+): string {
+  switch (kind) {
+    case 'private':
+      if (relativePath.includes('/')) {
+        throw new Error(
+          'Private memory drafts must be top-level markdown files.',
+        );
+      }
+      return path.join(config.storage.getProjectMemoryTempDir(), relativePath);
+    case 'global':
+      if (relativePath.includes('/')) {
+        throw new Error(
+          'Global memory drafts must be top-level markdown files.',
+        );
+      }
+      return relativePath === path.basename(getGlobalMemoryFilePath())
+        ? getGlobalMemoryFilePath()
+        : path.join(path.dirname(getGlobalMemoryFilePath()), relativePath);
+    case 'project-instructions':
+      return path.join(resolveProjectRoot(config), relativePath);
+    default:
+      throw new Error('Unknown memory draft kind.');
+  }
+}
+
+async function getFileMtimeIso(filePath: string): Promise<string | undefined> {
+  try {
+    const stats = await fs.stat(filePath);
+    return stats.mtime.toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+async function readFileIfExists(filePath: string): Promise<string> {
+  try {
+    return await fs.readFile(filePath, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
+async function getInboxMemoryDraftSourcePath(
+  config: Config,
+  kind: InboxMemoryDraftKind,
+  relativePath: string,
+): Promise<string | undefined> {
+  const normalizedPath = normalizeInboxMemoryDraftPath(relativePath);
+  if (!normalizedPath) {
+    return undefined;
+  }
+
+  const draftRoot = path.resolve(
+    getMemoryDraftRoot(config.storage.getProjectMemoryTempDir(), kind),
+  );
+  const sourcePath = path.resolve(draftRoot, ...normalizedPath.split('/'));
+  if (!isSubpathOrSame(sourcePath, draftRoot)) {
+    return undefined;
+  }
+  return sourcePath;
+}
+
+function formatInboxMemoryDraftDiff(
+  targetPath: string,
+  currentContent: string,
+  draftContent: string,
+): string {
+  return Diff.createTwoFilesPatch(
+    targetPath,
+    targetPath,
+    currentContent,
+    draftContent,
+    '',
+    '',
+    { context: 3 },
+  );
+}
+
 async function patchTargetsProjectSkills(
   targetPaths: string[],
   config: Config,
@@ -393,6 +546,201 @@ async function getPatchExtractedAt(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Scans the memory extraction inbox for reviewable markdown drafts.
+ */
+export async function listInboxMemoryDrafts(
+  config: Config,
+): Promise<InboxMemoryDraft[]> {
+  const memoryDir = config.storage.getProjectMemoryTempDir();
+  const kinds: InboxMemoryDraftKind[] = [
+    'private',
+    'global',
+    'project-instructions',
+  ];
+  const drafts: InboxMemoryDraft[] = [];
+
+  for (const kind of kinds) {
+    const draftRoot = getMemoryDraftRoot(memoryDir, kind);
+    const draftFiles: string[] = [];
+
+    async function walk(currentDir: string): Promise<void> {
+      let dirEntries: Array<import('node:fs').Dirent>;
+      try {
+        dirEntries = await fs.readdir(currentDir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of dirEntries) {
+        const entryPath = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(entryPath);
+          continue;
+        }
+        if (entry.isFile()) {
+          draftFiles.push(entryPath);
+        }
+      }
+    }
+
+    await walk(draftRoot);
+
+    for (const sourcePath of draftFiles) {
+      const relativePath = path
+        .relative(draftRoot, sourcePath)
+        .split(path.sep)
+        .join('/');
+      const normalizedPath = normalizeInboxMemoryDraftPath(relativePath);
+      if (!normalizedPath) {
+        continue;
+      }
+
+      let targetPath: string;
+      try {
+        targetPath = resolveMemoryDraftTargetPath(config, kind, normalizedPath);
+      } catch {
+        continue;
+      }
+
+      try {
+        const content = await fs.readFile(sourcePath, 'utf-8');
+        const currentContent = await readFileIfExists(targetPath);
+        drafts.push({
+          kind,
+          relativePath: normalizedPath,
+          name: normalizedPath,
+          targetPath,
+          content,
+          diffContent: formatInboxMemoryDraftDiff(
+            targetPath,
+            currentContent,
+            content,
+          ),
+          extractedAt: await getFileMtimeIso(sourcePath),
+        });
+      } catch {
+        // Skip unreadable draft files.
+      }
+    }
+  }
+
+  return drafts.sort((a, b) =>
+    `${a.kind}:${a.relativePath}`.localeCompare(`${b.kind}:${b.relativePath}`),
+  );
+}
+
+/**
+ * Applies a reviewable memory draft and removes it from the inbox.
+ */
+export async function applyInboxMemoryDraft(
+  config: Config,
+  kind: InboxMemoryDraftKind,
+  relativePath: string,
+): Promise<{ success: boolean; message: string }> {
+  const normalizedPath = normalizeInboxMemoryDraftPath(relativePath);
+  if (!normalizedPath) {
+    return {
+      success: false,
+      message: 'Invalid memory draft path.',
+    };
+  }
+
+  if (kind === 'project-instructions' && !config.isTrustedFolder()) {
+    return {
+      success: false,
+      message:
+        'Project instruction drafts are unavailable until this workspace is trusted.',
+    };
+  }
+
+  const sourcePath = await getInboxMemoryDraftSourcePath(
+    config,
+    kind,
+    normalizedPath,
+  );
+  if (!sourcePath) {
+    return {
+      success: false,
+      message: 'Invalid memory draft path.',
+    };
+  }
+
+  let content: string;
+  try {
+    content = await fs.readFile(sourcePath, 'utf-8');
+  } catch {
+    return {
+      success: false,
+      message: `Memory draft "${normalizedPath}" not found in inbox.`,
+    };
+  }
+
+  let targetPath: string;
+  try {
+    targetPath = resolveMemoryDraftTargetPath(config, kind, normalizedPath);
+  } catch (error) {
+    return {
+      success: false,
+      message: getErrorMessage(error),
+    };
+  }
+
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, content, 'utf-8');
+  await fs.unlink(sourcePath);
+
+  return {
+    success: true,
+    message: `Applied memory draft "${normalizedPath}".`,
+  };
+}
+
+/**
+ * Removes a reviewable memory draft from the inbox.
+ */
+export async function dismissInboxMemoryDraft(
+  config: Config,
+  kind: InboxMemoryDraftKind,
+  relativePath: string,
+): Promise<{ success: boolean; message: string }> {
+  const normalizedPath = normalizeInboxMemoryDraftPath(relativePath);
+  if (!normalizedPath) {
+    return {
+      success: false,
+      message: 'Invalid memory draft path.',
+    };
+  }
+
+  const sourcePath = await getInboxMemoryDraftSourcePath(
+    config,
+    kind,
+    normalizedPath,
+  );
+  if (!sourcePath) {
+    return {
+      success: false,
+      message: 'Invalid memory draft path.',
+    };
+  }
+
+  try {
+    await fs.access(sourcePath);
+  } catch {
+    return {
+      success: false,
+      message: `Memory draft "${normalizedPath}" not found in inbox.`,
+    };
+  }
+
+  await fs.unlink(sourcePath);
+
+  return {
+    success: true,
+    message: `Dismissed "${normalizedPath}" from inbox.`,
+  };
 }
 
 async function findNearestExistingDirectory(

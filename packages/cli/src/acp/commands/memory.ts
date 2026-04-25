@@ -6,6 +6,7 @@
 
 import {
   addMemory,
+  listInboxMemoryDrafts,
   listInboxSkills,
   listInboxPatches,
   listMemoryFiles,
@@ -129,7 +130,7 @@ export class AddMemoryCommand implements Command {
 export class InboxMemoryCommand implements Command {
   readonly name = 'memory inbox';
   readonly description =
-    'Lists skills extracted from past sessions that are pending review.';
+    'Lists memory items extracted from past sessions that are pending review.';
 
   async execute(
     context: CommandContext,
@@ -142,12 +143,17 @@ export class InboxMemoryCommand implements Command {
       };
     }
 
-    const [skills, patches] = await Promise.all([
+    const [skills, patches, memoryDrafts] = await Promise.all([
       listInboxSkills(context.agentContext.config),
       listInboxPatches(context.agentContext.config),
+      listInboxMemoryDrafts(context.agentContext.config),
     ]);
 
-    if (skills.length === 0 && patches.length === 0) {
+    if (
+      skills.length === 0 &&
+      patches.length === 0 &&
+      memoryDrafts.length === 0
+    ) {
       return { name: this.name, data: 'No items in inbox.' };
     }
 
@@ -165,8 +171,16 @@ export class InboxMemoryCommand implements Command {
         : '';
       lines.push(`- **${p.name}** (update): patches ${targets}${date}`);
     }
+    for (const draft of memoryDrafts) {
+      const date = draft.extractedAt
+        ? ` (extracted: ${new Date(draft.extractedAt).toLocaleDateString()})`
+        : '';
+      lines.push(
+        `- **${draft.name}** (${draft.kind} memory draft): updates ${draft.targetPath}${date}`,
+      );
+    }
 
-    const total = skills.length + patches.length;
+    const total = skills.length + patches.length + memoryDrafts.length;
     return {
       name: this.name,
       data: `Memory inbox (${total}):\n${lines.join('\n')}`,

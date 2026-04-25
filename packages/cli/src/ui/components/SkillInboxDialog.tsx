@@ -20,22 +20,32 @@ import {
   type Config,
   type InboxSkill,
   type InboxPatch,
+  type InboxMemoryDraft,
   type InboxSkillDestination,
   getErrorMessage,
   listInboxSkills,
   listInboxPatches,
+  listInboxMemoryDrafts,
   moveInboxSkill,
   dismissInboxSkill,
   applyInboxPatch,
   dismissInboxPatch,
+  applyInboxMemoryDraft,
+  dismissInboxMemoryDraft,
   isProjectSkillPatchTarget,
 } from '@google/gemini-cli-core';
 
-type Phase = 'list' | 'skill-preview' | 'skill-action' | 'patch-preview';
+type Phase =
+  | 'list'
+  | 'skill-preview'
+  | 'skill-action'
+  | 'patch-preview'
+  | 'memory-preview';
 
 type InboxItem =
   | { type: 'skill'; skill: InboxSkill }
   | { type: 'patch'; patch: InboxPatch; targetsProjectSkills: boolean }
+  | { type: 'memory-draft'; draft: InboxMemoryDraft }
   | { type: 'header'; label: string };
 
 interface DestinationChoice {
@@ -45,6 +55,12 @@ interface DestinationChoice {
 }
 
 interface PatchAction {
+  action: 'apply' | 'dismiss';
+  label: string;
+  description: string;
+}
+
+interface MemoryDraftAction {
   action: 'apply' | 'dismiss';
   label: string;
   description: string;
@@ -95,6 +111,19 @@ const PATCH_ACTION_CHOICES: PatchAction[] = [
   },
 ];
 
+const MEMORY_DRAFT_ACTION_CHOICES: MemoryDraftAction[] = [
+  {
+    action: 'apply',
+    label: 'Apply',
+    description: 'Apply draft and delete from inbox',
+  },
+  {
+    action: 'dismiss',
+    label: 'Dismiss',
+    description: 'Delete from inbox without applying',
+  },
+];
+
 function normalizePathForUi(filePath: string): string {
   return path.posix.normalize(filePath.replaceAll('\\', '/'));
 }
@@ -103,6 +132,19 @@ function getPathBasename(filePath: string): string {
   const normalizedPath = normalizePathForUi(filePath);
   const basename = path.posix.basename(normalizedPath);
   return basename === '.' ? filePath : basename;
+}
+
+function formatMemoryDraftKind(draft: InboxMemoryDraft): string {
+  switch (draft.kind) {
+    case 'private':
+      return 'Private memory';
+    case 'global':
+      return 'Global memory';
+    case 'project-instructions':
+      return 'Project instructions';
+    default:
+      return 'Memory draft';
+  }
 }
 
 async function patchTargetsProjectSkills(
@@ -177,12 +219,14 @@ interface SkillInboxDialogProps {
   config: Config;
   onClose: () => void;
   onReloadSkills: () => Promise<void>;
+  onReloadMemory?: () => Promise<void>;
 }
 
 export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
   config,
   onClose,
   onReloadSkills,
+  onReloadMemory,
 }) => {
   const keyMatchers = useKeyMatchers();
   const { stdout } = useStdout();
@@ -202,9 +246,10 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
     let cancelled = false;
     void (async () => {
       try {
-        const [skills, patches] = await Promise.all([
+        const [skills, patches, memoryDrafts] = await Promise.all([
           listInboxSkills(config),
           listInboxPatches(config),
+          listInboxMemoryDrafts(config),
         ]);
         const patchItems = await Promise.all(
           patches.map(async (patch): Promise<InboxItem> => {
@@ -229,6 +274,9 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
           const combined: InboxItem[] = [
             ...skills.map((skill): InboxItem => ({ type: 'skill', skill })),
             ...patchItems,
+            ...memoryDrafts.map(
+              (draft): InboxItem => ({ type: 'memory-draft', draft }),
+            ),
           ];
           setItems(combined);
           setLoading(false);
@@ -251,42 +299,38 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
         ? `skill:${item.skill.dirName}`
         : item.type === 'patch'
           ? `patch:${item.patch.fileName}`
-          : `header:${item.label}`,
+          : item.type === 'memory-draft'
+            ? `memory:${item.draft.kind}:${item.draft.relativePath}`
+            : `header:${item.label}`,
     [],
   );
 
   const listItems: Array<SelectionListItem<InboxItem>> = useMemo(() => {
     const skills = items.filter((i) => i.type === 'skill');
     const patches = items.filter((i) => i.type === 'patch');
+    const memoryDrafts = items.filter((i) => i.type === 'memory-draft');
     const result: Array<SelectionListItem<InboxItem>> = [];
 
-    // Only show section headers when both types are present
-    const showHeaders = skills.length > 0 && patches.length > 0;
+    const groups: Array<{ label: string; items: InboxItem[] }> = [
+      { label: 'New Skills', items: skills },
+      { label: 'Skill Updates', items: patches },
+      { label: 'Memory Drafts', items: memoryDrafts },
+    ].filter((group) => group.items.length > 0);
+    const showHeaders = groups.length > 1;
 
-    if (showHeaders) {
-      const header: InboxItem = { type: 'header', label: 'New Skills' };
-      result.push({
-        key: 'header:new-skills',
-        value: header,
-        disabled: true,
-        hideNumber: true,
-      });
-    }
-    for (const item of skills) {
-      result.push({ key: getItemKey(item), value: item });
-    }
-
-    if (showHeaders) {
-      const header: InboxItem = { type: 'header', label: 'Skill Updates' };
-      result.push({
-        key: 'header:skill-updates',
-        value: header,
-        disabled: true,
-        hideNumber: true,
-      });
-    }
-    for (const item of patches) {
-      result.push({ key: getItemKey(item), value: item });
+    for (const group of groups) {
+      if (showHeaders) {
+        const header: InboxItem = { type: 'header', label: group.label };
+        result.push({
+          key: `header:${group.label}`,
+          value: header,
+          disabled: true,
+          hideNumber: true,
+        });
+      }
+      for (const item of group.items) {
+        result.push({ key: getItemKey(item), value: item });
+      }
     }
 
     return result;
@@ -321,6 +365,14 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
     }
 
     return selectedItem.targetsProjectSkills;
+  }, [selectedItem]);
+
+  const selectedMemoryDraftRequiresTrust = useMemo(() => {
+    if (!selectedItem || selectedItem.type !== 'memory-draft') {
+      return false;
+    }
+
+    return selectedItem.draft.kind === 'project-instructions';
   }, [selectedItem]);
 
   const patchActionItems: Array<SelectionListItem<PatchAction>> = useMemo(
@@ -360,10 +412,44 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
       [],
     );
 
+  const memoryDraftActionItems: Array<SelectionListItem<MemoryDraftAction>> =
+    useMemo(
+      () =>
+        MEMORY_DRAFT_ACTION_CHOICES.map((choice) => {
+          if (
+            choice.action === 'apply' &&
+            selectedMemoryDraftRequiresTrust &&
+            !isTrustedFolder
+          ) {
+            return {
+              key: choice.action,
+              value: {
+                ...choice,
+                description:
+                  'Project instructions are unavailable until this workspace is trusted',
+              },
+              disabled: true,
+            };
+          }
+
+          return {
+            key: choice.action,
+            value: choice,
+          };
+        }),
+      [isTrustedFolder, selectedMemoryDraftRequiresTrust],
+    );
+
   const handleSelectItem = useCallback((item: InboxItem) => {
     setSelectedItem(item);
     setFeedback(null);
-    setPhase(item.type === 'skill' ? 'skill-preview' : 'patch-preview');
+    setPhase(
+      item.type === 'skill'
+        ? 'skill-preview'
+        : item.type === 'patch'
+          ? 'patch-preview'
+          : 'memory-preview',
+    );
   }, []);
 
   const removeItem = useCallback(
@@ -521,6 +607,77 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
     [config, selectedItem, onReloadSkills, removeItem],
   );
 
+  const handleSelectMemoryDraftAction = useCallback(
+    (choice: MemoryDraftAction) => {
+      if (!selectedItem || selectedItem.type !== 'memory-draft') return;
+      const draft = selectedItem.draft;
+
+      if (
+        choice.action === 'apply' &&
+        draft.kind === 'project-instructions' &&
+        !config.isTrustedFolder()
+      ) {
+        setFeedback({
+          text: 'Project instruction drafts are unavailable until this workspace is trusted.',
+          isError: true,
+        });
+        return;
+      }
+
+      setFeedback(null);
+
+      void (async () => {
+        try {
+          let result: { success: boolean; message: string };
+          if (choice.action === 'apply') {
+            result = await applyInboxMemoryDraft(
+              config,
+              draft.kind,
+              draft.relativePath,
+            );
+          } else {
+            result = await dismissInboxMemoryDraft(
+              config,
+              draft.kind,
+              draft.relativePath,
+            );
+          }
+
+          setFeedback({ text: result.message, isError: !result.success });
+
+          if (!result.success) {
+            return;
+          }
+
+          removeItem(selectedItem);
+          setSelectedItem(null);
+          setPhase('list');
+
+          if (choice.action === 'apply' && onReloadMemory) {
+            try {
+              await onReloadMemory();
+            } catch (error) {
+              setFeedback({
+                text: `${result.message} Failed to reload memory: ${getErrorMessage(error)}`,
+                isError: true,
+              });
+            }
+          }
+        } catch (error) {
+          const operation =
+            choice.action === 'apply'
+              ? 'apply memory draft'
+              : 'dismiss memory draft';
+          setFeedback({
+            text: `Failed to ${operation}: ${getErrorMessage(error)}`,
+            isError: true,
+          });
+        }
+      })();
+    },
+    [config, selectedItem, onReloadMemory, removeItem],
+  );
+
   useKeypress(
     (key) => {
       if (keyMatchers[Command.ESCAPE](key)) {
@@ -627,6 +784,32 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
                           <Text color={theme.text.secondary}>
                             {' · '}
                             {formatDate(skill.extractedAt)}
+                          </Text>
+                        )}
+                      </Box>
+                    </Box>
+                  );
+                }
+                if (item.value.type === 'memory-draft') {
+                  const draft = item.value.draft;
+                  return (
+                    <Box flexDirection="column" minHeight={2}>
+                      <Box flexDirection="row">
+                        <Text color={titleColor} bold>
+                          {draft.name}
+                        </Text>
+                        <Text color={theme.text.secondary}>
+                          {` [${formatMemoryDraftKind(draft)}]`}
+                        </Text>
+                      </Box>
+                      <Box flexDirection="row">
+                        <Text color={theme.text.secondary}>
+                          {getPathBasename(draft.targetPath)}
+                        </Text>
+                        {draft.extractedAt && (
+                          <Text color={theme.text.secondary}>
+                            {' · '}
+                            {formatDate(draft.extractedAt)}
                           </Text>
                         )}
                       </Box>
@@ -837,6 +1020,68 @@ export const SkillInboxDialog: React.FC<SkillInboxDialogProps> = ({
             <BaseSelectionList<PatchAction>
               items={patchActionItems}
               onSelect={handleSelectPatchAction}
+              isFocused={true}
+              showNumbers={true}
+              renderItem={(item, { titleColor }) => (
+                <Box flexDirection="column" minHeight={2}>
+                  <Text color={titleColor} bold>
+                    {item.value.label}
+                  </Text>
+                  <Text color={theme.text.secondary}>
+                    {item.value.description}
+                  </Text>
+                </Box>
+              )}
+            />
+          </Box>
+
+          {feedback && (
+            <Box marginTop={1}>
+              <Text
+                color={
+                  feedback.isError ? theme.status.error : theme.status.success
+                }
+              >
+                {feedback.isError ? '✗ ' : '✓ '}
+                {feedback.text}
+              </Text>
+            </Box>
+          )}
+
+          <DialogFooter
+            primaryAction="Enter to confirm"
+            cancelAction="Esc to go back"
+          />
+        </>
+      )}
+
+      {phase === 'memory-preview' && selectedItem?.type === 'memory-draft' && (
+        <>
+          <Text bold>{selectedItem.draft.name}</Text>
+          <Box flexDirection="row">
+            <Text color={theme.text.secondary}>
+              Review memory draft before applying.
+            </Text>
+            <Text color={theme.text.secondary}>
+              {` [${formatMemoryDraftKind(selectedItem.draft)}]`}
+            </Text>
+          </Box>
+
+          <Box flexDirection="column" marginTop={1}>
+            <Text color={theme.text.secondary} bold>
+              {selectedItem.draft.targetPath}
+            </Text>
+            <DiffRenderer
+              diffContent={selectedItem.draft.diffContent}
+              filename={selectedItem.draft.targetPath}
+              terminalWidth={contentWidth}
+            />
+          </Box>
+
+          <Box flexDirection="column" marginTop={1}>
+            <BaseSelectionList<MemoryDraftAction>
+              items={memoryDraftActionItems}
+              onSelect={handleSelectMemoryDraftAction}
               isFocused={true}
               showNumbers={true}
               renderItem={(item, { titleColor }) => (
