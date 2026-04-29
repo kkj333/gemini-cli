@@ -1,6 +1,9 @@
 name: 'Build Unsigned Mac Binaries'
 
 on:
+  push:
+    branches:
+      - 'sea-binary'
   workflow_dispatch:
 
 permissions:
